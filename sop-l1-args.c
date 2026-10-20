@@ -1,160 +1,102 @@
 // =====================================================================================================
-// SOP1 L1 – przechodzenie po flagach uruchomienia (getopt). Działający program: skompiluj i poeksperymentuj.
+// SOP1 L1 – czytanie flag programu (-p ścieżka, -n 5, -v). DWIE funkcje, każdą wołasz osobno dla każdej flagi.
 // -----------------------------------------------------------------------------------------------------
-// Kompilacja:  gcc -Wall -Wextra -fsanitize=address,undefined -o args sop-l1-args.c
-// Przykład:    ./args -p dir1 -p dir2 -n 5 -o out.txt -v extra1 extra2
+// CO SKOPIOWAĆ:  nagłówki + usage + read_repeated_flag i/lub read_single_flag. main na dole to tylko przykład.
 //
-// Jak przerobić pod zadanie (3 miejsca):
-//   1. OPTION_STRING – litery flag; ':' PO literze = flaga wymaga wartości ("p:" → -p ścieżka), bez ':' = flaga on/off ("v").
-//   2. ProgramOptions – pola na wartości flag (+ domyślne wartości w parse_program_options).
-//   3. switch w parse_program_options – co zrobić z każdą flagą.
+// Oba wywołania dostają ten sam string ALL_FLAGS = wszystkie flagi programu, np. "p:n:v":
+//     litera z ':' po niej  = flaga z wartością   (-p ścieżka, -n 5)
+//     litera bez ':'        = flaga bez wartości  (-v)
+// Nieznana flaga albo brak wartości → usage (komunikat + exit).
 //
-// Na co uważać:
-//   * Wartość flagi jest w optarg – to wskaźnik do argv, NIE kopiuj go, nie zwalniaj; żyje do końca programu.
-//   * Po pętli argv[optind] .. argv[argc - 1] to argumenty BEZ flag (pozycyjne), np. "prog -v plik1 plik2".
-//   * getopt akceptuje "-n5" i "-n 5", sklejone flagi "-vp dir" oraz "--" jako koniec flag.
-//   * Na Linuksie (glibc) argumenty bez flag mogą stać też PRZED flagami ("prog x -p d1 y") – getopt przestawia je na koniec argv.
-//   * atoi("abc") = 0 bez błędu – do liczb używaj parse_positive_number_or_exit (strtol ze sprawdzaniem).
-//   * Kolejność flag jest dowolna; ta sama flaga może wystąpić kilka razy (tu -p zbiera się do tablicy).
-//   * Funkcja usage NA KOŃCU robi exit(EXIT_FAILURE) – tak wymagają zadania przy złych argumentach.
+// Kompilacja i test:  gcc -Wall -Wextra -o args sop-l1-args.c && ./args -p a -p b -n 5 -v
 // =====================================================================================================
 
 #define _GNU_SOURCE
 
-#include <errno.h>
 #include <getopt.h>
-#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define ERR(source) (perror(source), fprintf(stderr, "%s:%d\n", __FILE__, __LINE__), exit(EXIT_FAILURE))
-
-// ':' NA POCZĄTKU = getopt nie wypisuje własnych błędów i zwraca ':' przy brakującej wartości, '?' przy nieznanej fladze.
-#define OPTION_STRING ":p:n:o:v"
-
-// Wszystkie wartości z linii poleceń w jednym miejscu – przekazuj &options do funkcji etapów.
-typedef struct
-{
-    char** input_paths;          // wszystkie wartości -p (tablica wskaźników do argv)
-    int input_paths_count;       // ile razy podano -p
-    int repeat_count;            // -n liczba (domyślnie 1)
-    const char* output_path;     // -o plik (NULL = nie podano)
-    int verbose_enabled;         // -v (0/1)
-    char** positional_arguments; // argumenty bez flag (wskazuje do środka argv)
-    int positional_count;
-} ProgramOptions;
-
-// usage(argv[0]) -> wypisuje poprawne użycie na stderr i KOŃCZY program kodem błędu. Dopasuj tekst do zadania.
+// usage(argv[0]) -> wypisuje poprawne użycie i KOŃCZY program. Zmień tekst pod zadanie.
 void usage(const char* program_name)
 {
-    fprintf(stderr, "USAGE: %s -p path [-p path ...] [-n positive_number] [-o output_file] [-v] [extra ...]\n", program_name);
-    fprintf(stderr, "  -p path    input path, can be repeated, at least one required\n");
-    fprintf(stderr, "  -n number  positive number (default 1)\n");
-    fprintf(stderr, "  -o file    output file (only once)\n");
-    fprintf(stderr, "  -v         verbose\n");
+    fprintf(stderr, "USAGE: %s -p path [-p path ...] -n number [-v]\n", program_name);
     exit(EXIT_FAILURE);
 }
 
-// parse_positive_number_or_exit("12", 'n', argv[0]) -> 12; dla "abc", "12x", "", "0", "-3" albo za dużej liczby wywołuje usage (exit).
-//   Zmień warunek "number_value <= 0", jeśli zadanie dopuszcza 0 albo ma zakres (np. 1..20).
-int parse_positive_number_or_exit(const char* number_text, char option_letter, const char* program_name)
+// read_repeated_flag(argc, argv, "p:n:v", 'p', paths) -> wpisuje do paths wartości WSZYSTKICH wystąpień -p, zwraca ich liczbę (0 = nie było).
+//   found_values – tablica, którą tworzysz sam:  char* paths[argc];   (więcej wartości niż argc być nie może)
+//   Wartości to wskaźniki do argv – nie kopiuj, nie rób free.
+//   Przykład:  ./prog -p a -n 5 -p b   →   paths = {"a", "b"}, zwraca 2
+int read_repeated_flag(int argc, char** argv, const char* all_flags, char wanted_flag, char** found_values)
 {
-    char* first_invalid_character;
-    errno = 0;
-    long number_value = strtol(number_text, &first_invalid_character, 10);
-    if (errno != 0 || first_invalid_character == number_text || *first_invalid_character != 0 || number_value <= 0 ||
-        number_value > INT_MAX)
+    int found_count = 0;
+    int option_character;
+    optind = 1;  // zaczynamy od początku argv – dzięki temu funkcję można wołać wiele razy
+    while ((option_character = getopt(argc, argv, all_flags)) != -1)
     {
-        fprintf(stderr, "Invalid value for -%c: \"%s\"\n", option_letter, number_text);
-        usage(program_name);
+        if (option_character == '?')  // nieznana flaga albo brak wartości (getopt już wypisał komunikat)
+            usage(argv[0]);
+        if (option_character == wanted_flag)
+            found_values[found_count++] = optarg;
     }
-    return (int)number_value;
+    return found_count;
 }
 
-// parse_program_options(argc, argv, &options) -> wypełnia options na podstawie flag; przy złych argumentach usage (exit).
-//   Po wywołaniu: options.input_paths[0..input_paths_count-1], options.positional_arguments[0..positional_count-1].
-//   Zwolnij potem tylko options.input_paths (free) – same stringi należą do argv.
-void parse_program_options(int argc, char** argv, ProgramOptions* options)
+// read_single_flag(argc, argv, "p:n:v", 'n') -> wartość flagi -n albo NULL, gdy jej nie podano; drugie wystąpienie → usage.
+//   Dla flagi BEZ wartości (np. 'v') zwraca "" gdy jest, NULL gdy jej nie ma  →  int verbose = read_single_flag(...) != NULL;
+//   Flaga wymagana?  if (value == NULL) usage(argv[0]);
+//   Liczba?          int n = atoi(value);   (atoi("abc") = 0 – sprawdź n > 0, jeśli ma być dodatnia)
+char* read_single_flag(int argc, char** argv, const char* all_flags, char wanted_flag)
 {
-    // wartości domyślne
-    options->input_paths = malloc(argc * sizeof(char*));  // -p nie może wystąpić więcej razy niż jest argumentów
-    if (!options->input_paths)
-        ERR("malloc");
-    options->input_paths_count = 0;
-    options->repeat_count = 1;
-    options->output_path = NULL;
-    options->verbose_enabled = 0;
-
+    char* found_value = NULL;
     int option_character;
-    while ((option_character = getopt(argc, argv, OPTION_STRING)) != -1)
+    const char* flag_in_all_flags = strchr(all_flags, wanted_flag);
+    int flag_has_value = flag_in_all_flags != NULL && flag_in_all_flags[1] == ':';
+    optind = 1;
+    while ((option_character = getopt(argc, argv, all_flags)) != -1)
     {
-        switch (option_character)
+        if (option_character == '?')
+            usage(argv[0]);
+        if (option_character == wanted_flag)
         {
-            case 'p':  // powtarzalna flaga z wartością → zbieramy do tablicy
-                options->input_paths[options->input_paths_count++] = optarg;
-                break;
-            case 'n':  // liczba z walidacją
-                options->repeat_count = parse_positive_number_or_exit(optarg, 'n', argv[0]);
-                break;
-            case 'o':  // flaga z wartością, która może wystąpić tylko raz
-                if (options->output_path != NULL)
-                {
-                    fprintf(stderr, "Option -o given more than once\n");
-                    usage(argv[0]);
-                }
-                options->output_path = optarg;
-                break;
-            case 'v':  // flaga on/off
-                options->verbose_enabled = 1;
-                break;
-            case ':':  // flaga wymaga wartości, a jej nie ma (np. "./args -p"); litera flagi jest w optopt
-                fprintf(stderr, "Option -%c requires a value\n", optopt);
+            if (found_value != NULL)  // już raz była
+            {
+                fprintf(stderr, "Option -%c given more than once\n", wanted_flag);
                 usage(argv[0]);
-                break;
-            default:  // '?' = nieznana flaga (np. "-x")
-                fprintf(stderr, "Unknown option -%c\n", optopt);
-                usage(argv[0]);
+            }
+            found_value = flag_has_value ? optarg : "";
         }
     }
-
-    // wymagane flagi sprawdzamy PO pętli
-    if (options->input_paths_count == 0)
-    {
-        fprintf(stderr, "At least one -p is required\n");
-        usage(argv[0]);
-    }
-
-    // argumenty bez flag – zostają od optind do końca argv
-    options->positional_arguments = argv + optind;
-    options->positional_count = argc - optind;
+    return found_value;
 }
 
-// ===== WERSJA BEZ getopt – gdy zadanie mówi np. "prog n k p1 p2 ..." (same argumenty, bez myślników) =====
-// iterate_arguments_manually(argc, argv) -> argv[0] to nazwa programu, argv[1..argc-1] to kolejne argumenty; sprawdź liczbę na starcie.
-void iterate_arguments_manually(int argc, char** argv)
-{
-    if (argc < 2)  // dopasuj minimalną liczbę argumentów do zadania
-        usage(argv[0]);
-    for (int argument_index = 1; argument_index < argc; argument_index++)
-        printf("argv[%d] = %s\n", argument_index, argv[argument_index]);
-}
+// ===== PRZYKŁAD UŻYCIA =====
+#define ALL_FLAGS "p:n:v"
 
 int main(int argc, char** argv)
 {
-    ProgramOptions options;
-    parse_program_options(argc, argv, &options);
+    // -p może być wiele razy, co najmniej raz
+    char* paths[argc];
+    int paths_count = read_repeated_flag(argc, argv, ALL_FLAGS, 'p', paths);
+    if (paths_count == 0)
+        usage(argv[0]);
 
-    printf("input paths (%d):\n", options.input_paths_count);
-    for (int path_index = 0; path_index < options.input_paths_count; path_index++)
-        printf("  %s\n", options.input_paths[path_index]);
-    printf("repeat count: %d\n", options.repeat_count);
-    printf("output path: %s\n", options.output_path ? options.output_path : "(none, use stdout)");
-    printf("verbose: %s\n", options.verbose_enabled ? "yes" : "no");
-    printf("positional arguments (%d):\n", options.positional_count);
-    for (int argument_index = 0; argument_index < options.positional_count; argument_index++)
-        printf("  %s\n", options.positional_arguments[argument_index]);
+    // -n dokładnie raz, dodatnia liczba
+    char* number_text = read_single_flag(argc, argv, ALL_FLAGS, 'n');
+    if (number_text == NULL)
+        usage(argv[0]);
+    int number = atoi(number_text);
+    if (number <= 0)
+        usage(argv[0]);
 
-    free(options.input_paths);
+    // -v opcjonalne, bez wartości
+    int verbose = read_single_flag(argc, argv, ALL_FLAGS, 'v') != NULL;
+
+    for (int i = 0; i < paths_count; i++)
+        printf("path: %s\n", paths[i]);
+    printf("number: %d\n", number);
+    printf("verbose: %d\n", verbose);
     return EXIT_SUCCESS;
 }
